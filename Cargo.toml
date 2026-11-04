@@ -6,6 +6,7 @@ readme = "README.md"
 authors = ["sl91994 <112153975+sl91994@users.noreply.github.com>"]
 edition = "2024"
 
+# build.rs を持つ依存関係が組み込まれているが，cargo-buildscan 自身で検証し，CIで毎回自己スキャンしてリリースする
 [dependencies]
 cargo_metadata = "0.23.1"
 lexopt = "0.3.2"
