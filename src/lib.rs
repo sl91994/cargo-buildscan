@@ -4,3 +4,6 @@
 
 #[doc(hidden)]
 pub mod error;
+
+#[doc(hidden)]
+pub mod cli;
