@@ -10,3 +10,9 @@ pub mod cli;
 
 #[doc(hidden)]
 pub mod config;
+
+#[doc(hidden)]
+pub mod judge;
+
+#[doc(hidden)]
+pub mod source;

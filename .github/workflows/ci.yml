@@ -14,25 +14,48 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    name: fmt + clippy + test
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (1.98.1 + rustfmt + clippy)
+      - name: Install Rust (1.98.1 + rustfmt)
         uses: dtolnay/rust-toolchain@1.98.1
         with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+          components: rustfmt
 
       - name: Format
         run: cargo fmt --all -- --check
 
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (1.98.1 + clippy)
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (1.98.1)
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
 
       - name: Test
         run: cargo test --all-features
