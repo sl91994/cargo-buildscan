@@ -1,5 +1,7 @@
 # cargo-buildscan
 
+[![CI](https://github.com/sl91994/cargo-buildscan/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sl91994/cargo-buildscan/actions/workflows/ci.yml)
+
 依存クレートの **build script (`build.rs`)** を **実行せずに** 静的解析し，ネットワーク・プロセス起動・ファイル書き込みなどの操作を定型の範囲でしか行わないものを除外して，残りを根拠となるコード位置付きで報告する `cargo` サブコマンドです．
 
 目的は防御ではなく **レビュー対象の削減** です．報告されたものを人間が読むための **一次選別** であり，報告されなかったものが安全であることは保証しません．
