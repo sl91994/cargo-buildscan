@@ -1,188 +1,175 @@
 # cargo-buildscan 設計 (v0.1)
 
-本書は判定ルールとその根拠を定めます．CLI，出力形式，ベースライン形式，finding の重大度などの外部仕様は [README](README.md) を正とします．
+本書は判定ルールとその根拠を定めます．CLI，出力形式，finding の重大度などの外部仕様は [README](README.md) を正とします．
 
 ## 1. 目的と範囲
 
-依存クレートの build script を **実行せずに** 静的解析し，監視対象の操作を定型の範囲でしか行わないものを除外して，残りを根拠となるコード位置付きで報告します．
+依存クレートの build script を **実行せずに** 静的解析し，**既知の危険な操作** (ネットワーク，実行権限の付与，rustc 以外のプロセス起動，`OUT_DIR` 外と明らかな書き込み) を根拠となるコード位置付きで報告します．
 
-目的は **レビュー対象の削減** です．v0.1 が約束するのは「読む対象を，機械的に説明できる根拠付きで減らす」ことであり，報告されなかったものの安全ではありません．
+v0.1 は **拒否リスト方式** です．明らかに怪しい操作だけを報告し，それ以外は報告しません．このため「報告されなかったもの = 定型の操作しかしない」とは言えません．定型の操作しかしないことの確認 (許可リスト方式) は v0.2 で導入します (付録)．
 
 v0.1 では以下を扱いません．
 
 - build script 以外の解析 (proc macro，build-dependency のライブラリ側，C ソースや `CMakeLists.txt` などの外部ファイル)．
-- 関数をまたぐ値の追跡，マクロ展開．
-- 難読化やプロセスの切り離しの検出．それ自体は害を持たず，害のある操作は別の finding として現れるためです．
-- メタデータ由来のシグナル (typosquat 名など)，diff モード，プラットフォームによる絞り込み，ワークスペースメンバーの解析，SARIF 出力．
+- build script のルートファイル以外の読み込み (外部の `mod`，`include!` 類)．読み込まずに `unanalyzable` とします (§3.4)．
+- マクロの中身の解析，値の流れの追跡 (変数をたどらない)．
+- 拒否リスト (§3.3) にない操作．環境変数の読み取り，`OpenOptions`，リンク作成，`exec-arg`，`build-dep`，`macro` などのルールは v0.2 で扱います．
+- ベースライン，JSON 出力，メタデータ由来のシグナル (typosquat 名など)，diff モード，プラットフォームによる絞り込み，ワークスペースメンバーの解析，SARIF 出力．
 
 ## 2. 脅威モデル
 
-- **攻撃者**: crates.io に悪性の build script を含むクレートを公開できます (新規公開，またはメンテナアカウントの乗っ取り)．推移的依存の奥に置かれる可能性があります．本ツールの存在とルールを知りえます．
+- **攻撃者**: crates.io に悪性の build script を含むクレートを公開できます (新規公開，またはメンテナアカウントの乗っ取り)．推移的依存の奥に置かれる可能性があります．
+- **v0.1 が想定する攻撃**: 本ツールを意識せずに書かれた悪性の build script (`proc-macro1` 型)．**ルールを知る攻撃者による回避には耐えません．** マクロの中や変数経由に操作を置くだけで回避できます (§2.1)．
 - **信頼するもの**: `cargo`，crates.io のインデックス，利用者自身の環境変数と cargo の設定 (`RUSTFLAGS` など)．
 - **前提**: 利用者は reported になった build script を実際に読むものとします．
 
 ### 2.1 既知の限界
 
-- ファイルの **読み取り** は監視しません．読み取った情報を `OUT_DIR` に書き込み，`include!` などで成果物に埋め込めば，許可された操作しか現れません．
-- 許可リスト (§3.2) の build-dependency は中身を解析せずに信頼します．悪性ロジックをそのライブラリ側に置かれると検出できません．
-- 外部ファイル (C ソース，ビルドスクリプト) は解析もハッシュもしません．同梱された実行ファイルの検出は cargo-deny の `[bans.build]` に任せます．
-- マクロ内の悪性コード．ただし未知のマクロの使用自体は報告します．
-- 関数をまたぐ値の流れ．
-- 危険な引数のパターン (§3.4) は列挙であり，網羅を保証しません．
+- 拒否リストにない操作は報告しません．ファイルの読み取り，環境変数の読み取り，`OpenOptions` による書き込み，リンク作成，FFI，外部プログラムを指定する引数 (`cc::Build::compiler`，`cargo:rustc-link-arg` など) が該当します．
+- マクロの中身は解析しません (`println!("{:?}", Command::new("sh").spawn())` は報告されない)．例外は `fs-write` の書き込み先の式に含まれるマクロで，文字列リテラルだけを拾います (§3.5)．
+- 値の流れを追いません．変数経由の書き込み先 (`let p = "/tmp/x"; fs::write(p, ..)`) は報告しません．
+- `type` エイリアス (`type C = std::process::Command;`) は追跡しません．
+- build-dependency のライブラリ側に悪性ロジックを置かれると検出できません．
+- 外部ファイル (C ソース，ビルドスクリプト) は解析しません．同梱された実行ファイルの検出は cargo-deny の `[bans.build]` に任せます．
 
 ## 3. 判定モデル
 
 ### 3.1 方針
 
-1. build script から **fact** (監視対象の操作) を抽出します．
-2. 許可パターン (§3.2) に一致しない fact は，すべて finding になります．
-3. finding が 0 件の build script を **recognized** とします．
+1. build script のルートファイル 1 つだけを構文解析します．
+2. 拒否リスト (§3.3) の操作が現れれば finding にします．
+3. 解析しない入力 (§3.4) は `unanalyzable` の finding にします．難しい入力は解析を頑張らず，報告して人間に渡します．
+4. finding が 0 件の build script を **recognized** とします．recognized は「既知の危険な操作が見つからなかった」ことだけを意味します．
 
-監視対象の名前 (`Command`，`TcpStream`，`set_mode` など) が現れたとき，許可パターンで説明できなければ finding にします．**説明できない出現は報告側に倒します．**
+監視対象が判定できない形で現れたときの扱いはルールごとに決めます．正当な build script でもよく現れる形 (変数を書き込み先に使うなど) は報告せず，正当な build script ではまれな形 (関数ポインタとしての使用など) は報告します．
 
-### 3.2 許可パターン
+### 3.2 名前の照合
 
-| 操作                     | 許可される条件                                                                                                                                                        |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 環境変数の読み取り       | 名前が文字列リテラルで，機密パターン (§3.3) に一致しない                                                                                                              |
-| プロセス起動             | program の由来 (§3.5) が `RUSTC` / `RUSTC_WRAPPER` / `RUSTC_WORKSPACE_WRAPPER` の環境変数かリテラル `"rustc"` のみで，引数が §3.4 を満たす                            |
-| ファイルの書き込み・削除 | 書き込み先の由来が `OUT_DIR` 配下と判定できる．リンク作成 (`symlink`，`hard_link`) は常に finding とします                                                            |
-| build-dependency の使用  | `cc`，`pkg-config`，`autocfg`，`version_check`，`rustc_version`，`bindgen`，`cfg_aliases`，`rustversion` で，source が crates.io．ただし §3.4 の API は別に検査します |
-| `cargo:` ディレクティブ  | §3.4 に該当しない                                                                                                                                                     |
+syn は名前解決をしないため，次のように近似します．
 
-- 環境変数を cargo の設定するものに限定しないのは，`ZSTD_SYS_USE_PKG_CONFIG` のようなクレート固有の設定変数が一般的なためです．危険な読み取りは機密パターンで捉えます．
-- `cmake` は許可しません．`CMakeLists.txt` は任意のコマンドを実行でき，その中身を解析しないためです．
-- build-dependency の同一性は，コード上の名前ではなく `cargo metadata` で解決したパッケージ名と source で判定します．`cc = { package = "other" }` のような改名は許可されません．
-- リンク作成を常に finding とするのは，リンク先を検査しないと `OUT_DIR` 外への書き込みの経路になるためです．
+- ファイルごとに，グロブでない `use` (別名 `as`，入れ子の `{}`，`self` を含む) と `extern crate ... as ...` から，名前 → 完全パスの表を作ります．モジュールのスコープは区別せず，同じ名前に複数の候補があればすべてを照合します．
+- パスの先頭のセグメントを表で置き換えてから照合します (`use std::process::Command as C;` の後の `C::new` は `std::process::Command::new`)．先頭の `::` は除きます．
+- 関数と型は **パスの末尾** で照合します (`Command::new` は `std::process::Command::new` にも `x::Command::new` にも一致)．ユーザー定義の同名の型も対象になりますが，過検出側に倒します．
+- モジュールは **パスの先頭** で照合します (`std::net`)．
+- メソッド呼び出しは名前だけで照合します．型推論は行いません．
+- 監視対象のモジュールからのグロブインポートは照合せず，`unanalyzable` とします (§3.4)．
 
-### 3.3 finding
+### 3.3 拒否リスト (finding)
 
 重大度は README の表を正とします．重大度は表示順にのみ使い，終了コードには影響しません．
 
-| ID               | 条件                                                                                                            |
-| ---------------- | --------------------------------------------------------------------------------------------------------------- |
-| `net`            | `std::net` の使用，既知の HTTP クレート (`reqwest`，`ureq`，`curl`，`hyper`，`attohttpc`，`minreq` など) の使用 |
-| `set-executable` | `PermissionsExt::set_mode` / `from_mode`，`set_permissions`                                                     |
-| `env-secret`     | 機密パターンに一致する環境変数の読み取り，`env::vars` / `vars_os`，`env::home_dir`                              |
-| `exec-arg`       | 外部プログラムを指定しうる API・引数・ディレクティブ (§3.4)                                                     |
-| `unanalyzable`   | 構文エラー，動的なパスの `include!` 類，パッケージルート外を指すパス，サイズ超過                                |
-| `spawn`          | program が §3.2 の条件を満たさないプロセス起動 (`Command::new`，`CommandExt::exec` など)                        |
-| `fs-write`       | `OUT_DIR` 配下と判定できない書き込み・削除・リネーム，リンク作成                                                |
-| `env-dynamic`    | 名前が文字列リテラルでない環境変数の読み取り                                                                    |
-| `build-dep`      | 許可リスト外の build-dependency の使用 (関数，マクロ，属性)                                                     |
-| `unsafe`         | `unsafe` ブロック，`extern` ブロック，`asm!` / `global_asm!`                                                    |
-| `macro`          | 標準・許可リスト外のマクロ呼び出し，`macro_rules!` の定義                                                       |
+| ID               | 条件                                                                                                                                                                                                                                                       |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `net`            | `std::net`，`std::os::unix::net` の使用 (`use` を含む)．既知の HTTP クレート (`reqwest`，`ureq`，`curl`，`hyper`，`attohttpc`，`minreq` など) のパスと `extern crate`．build-dependency に既知の HTTP クレートを持つこと (メタデータで判定，位置なし) |
+| `set-executable` | 名前が `set_mode`，`from_mode`，`set_permissions` の関数・メソッド・パス                                                                                                                                                                                  |
+| `spawn`          | program が §3.5 を満たさない `Command::new`．`Command::new` の呼び出し以外の形での出現                                                                                                                                                                     |
+| `fs-write`       | `env::temp_dir`，`env::home_dir` の使用．書き込み系の関数の書き込み先が危険なリテラル (§3.5) を含むこと．書き込み系の関数の呼び出し以外の形での出現                                                                                                        |
+| `unanalyzable`   | §3.4 の入力                                                                                                                                                                                                                                                |
 
-機密パターン: `HOME`，`USERPROFILE`，`SSH_*`，`AWS_*`，`GITHUB_*`，`*_TOKEN`，`*_KEY`，`*SECRET*`，`*PASSWORD*` など．
+- **書き込み系の関数**: `fs::write`，`File::create`，`fs::copy` (書き込み先は第 2 引数)，`fs::rename` (両方の引数)，`fs::create_dir` / `create_dir_all`，`fs::remove_file` / `remove_dir` / `remove_dir_all`．
+- `env::temp_dir` / `env::home_dir` は，書き込みに使うかどうかによらず報告します．build script の書き込み先は `OUT_DIR` であるべきで，正当な build script ではまれなうえ，変数を経由した書き込み (`let p = env::temp_dir().join("x"); fs::write(&p, ..)`) を値の追跡なしで捉えられるためです．
+- build-dependency の HTTP クレートをメタデータで判定するのは，`Cargo.toml` の改名 (`r = { package = "reqwest" }`) でコード上の名前を変えられるためです．
+- 監視対象の名前，HTTP クレート，書き込み系の関数，危険なリテラル，グロブを禁じるモジュールの一覧は `config.rs` の 1 か所にまとめます．
 
-監視対象の名前，機密パターン，許可リスト，§3.4 の一覧は `config.rs` の 1 か所にまとめます．
+**任意 (余裕があれば v0.1 に入れる)**: 以下は小さいため，v0.1 に入れてもかまいません．入れた場合は README の表にも加えます．
 
-### 3.4 外部プログラムを指定しうる引数 (`exec-arg`)
+| ID           | 条件                                                                                                                                                                        |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `env-secret` | 名前が文字列リテラルの `env::var` / `var_os` / `env!` / `option_env!` で，機密パターン (`HOME`，`SSH_*`，`AWS_*`，`*_TOKEN`，`*SECRET*` など) に一致．`env::vars` / `vars_os` |
+| `unsafe`     | `unsafe` ブロック，`extern` ブロック，`asm!` / `global_asm!`                                                                                                                |
 
-許可された操作 (rustc の起動，`cc` によるコンパイル，リンク) は，引数しだいで任意のプログラムを実行させられます．クレートに実行ファイルを同梱し，`CARGO_MANIFEST_DIR` 経由でそのパスを指せば，`set-executable` も `fs-write` も現れません．このため以下を finding とします．
+### 3.4 解析しない入力 (`unanalyzable`)
 
-- **プログラムを指定する API**: `cc::Build` の `compiler`，`archiver`，`ranlib` など．引数によらず常に finding．
-- **フラグを渡す API**: 許可された rustc 起動の `arg` / `args`，`cc::Build` の `flag` / `flags` / `flag_if_supported` など，`bindgen` の `clang_arg` / `clang_args`．引数の由来が `Unknown` を含むか，リテラルが危険パターンに一致すれば finding．
-  - rustc: `-C linker`，`linker=`，`-Z`，`--extern`，`@` で始まる引数ファイル．
-  - C コンパイラ: `-B`，`-fuse-ld`，`--ld-path`，`-fplugin`，`-specs`，`-Wl,`，`-Xlinker`，`-Xclang`．
-- **`cargo:` ディレクティブ**:
-  - `rustc-link-arg` 系 (`-bins`，`-bin`，`-tests`，`-examples`，`-benches`，`rustc-cdylib-link-arg` を含む) は常に finding．
-  - 標準出力への出力のうち，書式文字列の先頭がリテラルの `cargo:` で始まらないもの (`println!("{}", s)`，`io::stdout()` への書き込み) も，ディレクティブ名を決められないため finding．
+| 入力                                                                                    | 理由                                                                     |
+| --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| 構文エラー                                                                              | 解析できない．                                                           |
+| サイズ上限 (既定 1 MiB) を超えるファイル                                                | 解析に時間がかかりうる．位置なし．                                       |
+| 外部ファイルの `mod foo;` (`#[path]` 付きを含む)                                        | 読み込まない．インラインの `mod foo { .. }` は解析する．                 |
+| `include!` / `include_str!` / `include_bytes!`                                          | 読み込まない．                                                           |
+| `std`，`std::process`，`std::fs`，`std::env`，`std::os` 配下からのグロブインポート      | 未修飾の名前 (`write(..)`，`temp_dir()`) を照合できない．               |
 
-### 3.5 由来の追跡 (関数内のみ)
+ルートファイル以外を読み込まないため，パッケージルート外を指すパス，隣接するクレートの読み込み，シンボリックリンクを考える必要がありません．`std::net` からのグロブインポートは `std::net` の使用として `net` になります．
 
-式の由来を，値の出どころの **集合** として求めます．要素は `Env(名前)`，`Literal(文字列)`，`Unknown` の 3 種です．
+### 3.5 引数の判定 (同じ式の中のみ)
 
-- `env::var("X")` / `env::var_os("X")` は `{Env(X)}`，文字列リテラルは `{Literal(..)}` です．
-- ローカル変数は束縛時の由来を引き継ぎます (シャドーイングは後の束縛を優先し，再代入は和集合をとる)．
-- メソッド呼び出しはレシーバと引数の由来の和集合です．引数がクロージャのときは本体の由来を加えます．
-- `PathBuf::from`，`Path::new`，`OsString::from`，`String::from`，`Some`，`Ok`，参照・参照外し，`?`，`format!`，`concat!` などは引数の由来の和集合です．一覧は `config.rs` に置きます．
-- それ以外の関数呼び出し，フィールド，関数の引数，`static` / `const` は `{Unknown}` です．
+引数の式だけを見て判定します．変数はたどりません．
 
-判定:
+**program (`spawn`)**: 式が以下だけで組み立てられていれば許可します．
 
-- **program**: 集合が空でなく，`Unknown` を含まず，全要素が `Env("RUSTC")`，`Env("RUSTC_WRAPPER")`，`Env("RUSTC_WORKSPACE_WRAPPER")`，`Literal("rustc")` のいずれかです．
-  - 許可: `Command::new(env::var_os("RUSTC").unwrap_or(OsString::from("rustc")))`
-  - 不許可: 同一ファイル内のヘルパー関数 `cargo_env_var("RUSTC")` 経由 (`Unknown` になる)．
-- **書き込み先**: `Env("OUT_DIR")` を含み，`Unknown` と他の `Env` を含まず，すべての `Literal` が無害な相対パス (先頭が `/`，`\`，ドライブ文字でなく，`..` を含まない) です．
-  - 許可: `PathBuf::from(env::var("OUT_DIR")?).join("probe")`
-  - 不許可: `format!("/tmp/{}", out_dir)`
-- **フラグ**: §3.4 のとおりです．
+- 文字列リテラル `"rustc"`．
+- 名前が文字列リテラル `"RUSTC"`，`"RUSTC_WRAPPER"`，`"RUSTC_WORKSPACE_WRAPPER"` の `env::var` / `env::var_os`．
+- これらをつなぐ形: 参照・参照外し，`?`，括弧，メソッド呼び出し (レシーバと引数のすべてを同じ規則で検査し，クロージャは本体を検査する)，`OsString::from`，`PathBuf::from`，`String::from`，`Some`，`Ok` の呼び出し．
 
-### 3.6 名前の照合
+それ以外 (変数，他の関数呼び出し，フィールド，マクロ，他のリテラル) を含めば報告します．
 
-syn は名前解決をしないため，保守的に近似します．
+- 許可: `Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))`
+- 報告: `Command::new("git")`，`Command::new(rustc)` (変数)，`Command::new(cargo_env_var("RUSTC"))` (ヘルパー関数)
 
-- モジュールごとに `use` と `type` エイリアスの表を作り，別名を正規化します (`use std::process::Command as C;` の後の `C::new` は `Command::new`)．
-- 監視対象の名前は **パスの末尾の識別子** で照合します．ユーザー定義の同名の型も対象になりますが，過検出側に倒します．
-- 監視対象のモジュールからのグロブインポートがあるモジュールでは，未修飾の名前も照合します．
-- 型推論は行いません．メソッド呼び出しは名前だけで照合します．
+変数経由の rustc 起動 (`let rustc = env::var("RUSTC")?; Command::new(rustc)`) も報告されます．過検出ですが，読めば判断できる短いコードがほとんどです．
+
+**書き込み先 (`fs-write`)**: 書き込み先の式の中に，以下の文字列リテラルがあれば報告します．式に含まれるマクロ (`format!` など) は，トークン列から文字列リテラルだけを拾います．
+
+- `/`，`\`，`~`，ドライブ文字 (`C:` など) で始まる．
+- `..` を含む．
+
+例:
+
+- 報告: `fs::write("/tmp/x", ..)`，`File::create(format!("/tmp/{}", name))`，`fs::copy(src, "../../x")`
+- 報告しない: `fs::write(out_dir.join("x"), ..)`，`fs::write(p, ..)` (変数，§2.1)
 
 ## 4. 処理の流れ
 
 ```
-Resolve -> Locate -> Load -> Parse -> Extract facts -> Judge -> Baseline -> Report
+Resolve -> Locate -> Load -> Parse -> Judge -> Report
 ```
 
-- **Resolve**: `cargo metadata --format-version 1 --all-features` を `--filter-platform` なしで実行します．`--all-features` が有効にするのはワークスペースメンバーのフィーチャーのみであり，結果は `Cargo.lock` のパッケージ集合に一致します (小規模な例で確認済み，§10)．
-- **Locate**: kind に `custom-build` を含む target の `src_path` を得ます．`proc-macro` は未解析として一覧に記録します．build-dependency のコード上の名前 (改名を考慮) から，解決済みのパッケージ名と source への対応表を作ります．
-- **Load**: `mod` と `#[path]` を再帰的に解決します．`include!` / `include_str!` / `include_bytes!` は引数がリテラルのときのみ解決します．パッケージルート外を指すパス (シンボリックリンクは実体パスで判定) とサイズ超過 (既定 1 MiB) は `unanalyzable` とします．レジストリでは他クレートが隣接しており，`../` で別クレートを読み込めるためです．
-- **Parse**: `syn` (`full`，`visit`，`parsing`) と `proc-macro2` (`span-locations`) を使います．失敗は `unanalyzable` とします．
+- **Resolve**: `cargo metadata --format-version 1 --all-features` を `--filter-platform` なしで実行します．`--all-features` が有効にするのはワークスペースメンバーのフィーチャーのみであり，結果は `Cargo.lock` のパッケージ集合に一致します (小規模な例で確認済み，§9)．
+- **Locate**: kind に `custom-build` を含む target の `src_path` を得ます．`proc-macro` は未解析として一覧に記録します．build-dependency のパッケージ名を記録します (`net` のメタデータ判定に使う)．
+- **Load**: build script のルートファイルだけを読み込みます．サイズ超過は `unanalyzable`，読み込みの失敗 (I/O エラー) は status `error` とします．
+- **Parse**: `syn` (`full`，`visit`，`parsing`) と `proc-macro2` (`span-locations`) を使います．失敗は `unanalyzable` とします．§3.4 の入力もここで検出します．
+- **Judge**: `syn::visit` で走査し，§3.3 の finding を集めます．
+- **Report**: human 出力のみです．
 
 ## 5. 出力の安全性
 
-報告に含まれるクレート由来の文字列 (パス，リテラル，スニペット) は攻撃者が制御できます．
+報告に含まれるクレート由来の文字列 (パス，パッケージ名，source，スニペット，`cargo metadata` の stderr) は攻撃者が制御できます．
 
-- human 出力では制御文字 (ANSI エスケープ，CR，Unicode の双方向制御文字など) をエスケープします．
+- 制御文字 (ANSI エスケープ，CR，Unicode の双方向制御文字など) をエスケープします．
 - スニペットは最大長で切り詰めます．
-- JSON は `serde_json` の通常のエスケープに任せます．
 
-## 6. ベースライン
-
-- **ハッシュ**: Load で読み込んだ全ファイル (`include_bytes!` の対象を含む) をパッケージルートからの相対パスで並べ替え，`相対パス \0 内容 \0` を連結した SHA-256 です．build script が実行時に読むファイル，C ソース，外部ビルドスクリプト，build-dependency のコードは含みません．
-- **照合キー**: `(name, source, build_script_sha256)` です．version は使わず，build script が同一ならバージョンが上がっても再レビュー不要とします．source を含めるのは，別レジストリや git から取得した同名クレートに承認を流用させないためです．
-- approved は「build script の Rust ソースが承認時と同一」であることだけを意味します．`spawn`，`exec-arg`，`build-dep` を持つものはハッシュ対象外のファイルを実行しうるため，承認時に注意が必要です (README に明記する)．
-
-## 7. 依存方針
+## 6. 依存方針
 
 サプライチェーン対策ツール自身の依存が多いと説得力がありません．
 
 - 本クレートは build.rs を持ちません．
-- 直接の依存は `cargo_metadata`，`syn`，`proc-macro2`，`serde`，`serde_json`，`toml`，`sha2`，`lexopt` に限り，dev-dependency は `insta` のみとします．`syn` と `proc-macro2` は `default-features = false` で必要な機能だけを有効にします．
-- `anyhow` / `thiserror` は直接使わず，エラー型は自前の enum とします．どちらも build script を持ち，ヘルパー関数経由の環境変数読み取りで reported になる見込みのためです．
+- 直接の依存は `cargo_metadata`，`syn`，`proc-macro2`，`lexopt` に限り，dev-dependency は `insta` と `serde_json` (`cargo_metadata` の依存として既に含まれる) のみとします．`syn` と `proc-macro2` は `default-features = false` で必要な機能だけを有効にします．
+- `anyhow` / `thiserror` は直接使わず，エラー型は自前の enum とします．どちらも build script を持つためです．
 - lib + bin 構成としますが，lib の API は安定性を保証しません (`#[doc(hidden)]`)．
-- CI で自身の依存に対して実行し (dogfooding)，reported は読んだうえで理由付きでベースラインに記録します．cargo-deny も併用します．
 
-## 8. テスト
+## 7. テスト
 
-- **単体**: finding ごとに該当・非該当の両方．名前の照合と由来の追跡は個別に．
-- **fixture** (`tests/fixtures/`，誤ってビルドされないよう `.rs.txt` とする)．
-  - `benign/`: cargo の環境変数を読んで `cargo:` を出力する，`RUSTC` で版を調べる，`OUT_DIR` に書く，`cc` でコンパイルする，など．
-  - `malicious/`: `proc-macro1` 型 (`net`，`fs-write`，`set-executable`，`spawn` がすべて出る)，同梱した実行ファイルを `cc::Build::compiler` や `rustc-link-arg` で指すもの (`exec-arg` が出る)．**動作するペイロードは含めず**，URL は `example.invalid` にします．
-  - `known-misses/`: §2.1 の限界を示すもの (機密ファイルを読んで `OUT_DIR` に書くだけ，など)．**recognized になることを** 固定し，限界が文書と一致することを保証します．
-- **スナップショット**: 出力を `insta` で固定します．
-- **コーパス評価**: crates.io のダウンロード数上位 N 件のうち build script を持つものをオフラインで解析し，recognized 率と finding 別の内訳を README に載せます．目標値は設けません．
-  - 参考: 手元の 45 クレートを grep で調べた予備調査では，旧設計で約 24/45 が recognized の見込みでした．主な原因 (クレート固有の環境変数，`RUSTC_WRAPPER`，`cfg_aliases!` など) は本設計で許可に変更済みです．ヘルパー関数を使うもの (anyhow，proc-macro2 など) は引き続き reported になる見込みです．
+- **単体**: finding ごとに該当・非該当の両方．名前の照合と §3.5 の判定は個別に．
+- **fixture** (`tests/fixtures/`，誤ってビルドされないよう `.rs.txt` とする)．ルートファイル 1 つだけを解析するため，各 fixture は 1 ファイルです．
+  - `malicious/`: `proc-macro1` 型 (`net`，`fs-write`，`set-executable`，`spawn` がすべて出る)，§3.4 の入力．**動作するペイロードは含めず**，URL は `example.invalid` にします．
+  - `benign/`: 数件．cargo の環境変数を読んで `cargo:` を出力する，`RUSTC` で版を調べる，`OUT_DIR` に書く，など．
 
-## 9. v0.1 完了の定義
+## 8. v0.1 完了の定義
 
-- [ ] README の CLI，終了コード，出力形式が動作します．
-- [ ] §3.3 の全 finding が実装され，該当・非該当のテストがあります．
-- [ ] ベースラインの approve と照合が動作します．
-- [ ] `malicious/` と `known-misses/` の fixture が期待どおりの結果になります．
-- [ ] コーパス評価と dogfooding の結果を README に載せています．
+- [ ] README の CLI，終了コード，human 出力が動作します．
+- [ ] §3.3 の finding (任意を除く) と §3.4 の `unanalyzable` が実装され，該当・非該当のテストがあります．
+- [ ] `malicious/` の fixture で期待する finding がすべて出て，`benign/` の fixture が recognized になります．
+- [ ] README の「既知の限界」が §2.1 と一致しています．
 
-## 10. 未決事項
+## 9. 未決事項
 
-- `--all-features` の解決結果と `Cargo.lock` の一致を，複数メンバーのワークスペースやプラットフォーム固有の依存でも確認します．
-- §3.4 の API と危険パターンの網羅性．`cc` / `bindgen` / `pkg-config` の公開 API を確認します．
-- 機密パターンの範囲と，末尾一致による過検出の頻度．コーパス評価で確認します．
+- `--all-features` の解決結果と `Cargo.lock` の一致を，複数メンバーのワークスペースやプラットフォーム固有の依存でも確認します (v0.2)．
 - 名前 `cargo-buildscan` が crates.io で空いているか，公開時に再確認します．
 
-## 付録: v0.1 以降の候補
+## 付録: v0.2 以降の候補
 
-- 同一ファイル内のヘルパー関数の展開 (anyhow，proc-macro2 などの recognized 化)．
-- `--since`，`--filter-platform`，`--include-workspace`，`--show-recognized`．
-- メタデータ由来のシグナル，難読化・切り離しの検出，SARIF 出力．
-- build-dependency のライブラリ側，proc macro の解析．
-- cargo-vet / cargo-deny との連携．
+- **許可リスト方式への移行**: build script から監視対象の操作を抽出し，定型の範囲 (rustc の起動，`OUT_DIR` への書き込み，許可リストの build-dependency など) で説明できないものをすべて報告します．関数内の由来の追跡，マクロ引数の解析，`exec-arg`，`build-dep`，`macro`，`env-dynamic` を含みます．設計の詳細は v0.1 縮小前の本書 (`git show 106126c:DESIGN.md`) にあります．
+- **ベースライン**: build script のハッシュによるレビュー済みの記録と `approve` サブコマンド．許可リスト方式で残る誤検知を吸収するために導入します．
+- **読み込みの拡張**: `mod` / `#[path]` / `include!` の解決，パッケージルート外の参照の判定．
+- **ルールの追加**: `OpenOptions`，リンク作成，`env-secret` / `unsafe` (v0.1 で未実装の場合)．
+- **出力と評価**: JSON 出力，CLI の E2E テスト，dogfooding，コーパス評価，cargo-deny の導入．
+- 同一ファイル内のヘルパー関数の展開，`--since`，`--filter-platform`，`--include-workspace`，`--show-recognized`，メタデータ由来のシグナル，SARIF 出力，proc macro の解析，cargo-vet / cargo-deny との連携．
