@@ -16,3 +16,6 @@ pub mod judge;
 
 #[doc(hidden)]
 pub mod source;
+
+#[doc(hidden)]
+pub mod resolve;
