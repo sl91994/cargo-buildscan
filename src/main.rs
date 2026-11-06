@@ -17,8 +17,8 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode> {
     match cli::parse_args(std::env::args_os().skip(1))? {
-        Command::Help { approve } => {
-            print!("{}", if approve { cli::APPROVE_HELP } else { cli::HELP });
+        Command::Help => {
+            print!("{}", cli::HELP);
             Ok(ExitCode::SUCCESS)
         }
         Command::Version => {
@@ -27,6 +27,5 @@ fn run() -> Result<ExitCode> {
         }
         // MEMO: 未実装のまま 0 (reported なし) を返すと CI で素通りするため，エラー (2) にする
         Command::Scan(_) => Err(Error::Unimplemented("scan")),
-        Command::Approve { .. } => Err(Error::Unimplemented("approve")),
     }
 }

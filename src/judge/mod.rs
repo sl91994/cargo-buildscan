@@ -5,30 +5,17 @@ use crate::source::{Location, Source};
 /// finding の分類，出力用に "set-executable" 等の文字列へ変換する
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rule {
-    /// `std::net` の使用．
-    /// 既知のHTTPクレート (`reqwest`, `ureq`, `curl`, `hyper`, `attohttpc`, `minreq` 等) の使用
+    /// `std::net`，`std::os::unix::net` の使用．
+    /// 既知のHTTPクレート (`reqwest`, `ureq`, `curl`, `hyper`, `attohttpc`, `minreq` 等) の使用と build-dependency
     Net,
-    /// `PermissionsExt::set_mode`, `from_mode`, `set_permissions`
+    /// 名前が `set_mode`, `from_mode`, `set_permissions` の関数・メソッド・パス
     SetExecutable,
-    /// 機密パターンに一致する環境変数の読み取り．
-    /// `env::vars`, `vars_os`, `env::home_dir`
-    EnvSecret,
-    /// 外部プログラムを指定しうるAPI・引数・ディレクティブ
-    ExecArg,
-    /// 構文エラー，動的なパスの `include!` 類，パッケージルート外を指すパスやサイズ超過
+    /// 構文エラー，外部ファイルの `mod`，`include!` 類，監視対象モジュールからのグロブインポート，サイズ超過
     Unanalyzable,
-    /// 条件を満たさないプロセス起動 (`Command::new`, `CommandExt::exec` 等)
+    /// program が rustc と判定できない `Command::new`，呼び出し以外の形での出現
     Spawn,
-    /// `OUT_DIR` 配下と判断できない書き込み・削除・リネームやリンク作成
+    /// `env::temp_dir` / `env::home_dir` の使用，危険なリテラルを書き込み先に含む書き込み・削除
     FsWrite,
-    /// 名前が文字列リテラルでない環境変数の読み取り
-    EnvDynamic,
-    /// 許可リスト外の build-dependency の使用 (関数，マクロ，属性)
-    BuildDep,
-    /// `unsafe` ブロック，`extern` ブロック，`asm!`，`global_asm!`
-    Unsafe,
-    /// 標準・許可リスト外のマクロ呼び出し，`macro_rules!` の定義
-    Macro,
 }
 
 impl Rule {
@@ -37,15 +24,9 @@ impl Rule {
         match self {
             Rule::Net => "net",
             Rule::SetExecutable => "set-executable",
-            Rule::EnvSecret => "env-secret",
-            Rule::ExecArg => "exec-arg",
             Rule::Unanalyzable => "unanalyzable",
             Rule::Spawn => "spawn",
             Rule::FsWrite => "fs-write",
-            Rule::EnvDynamic => "env-dynamic",
-            Rule::BuildDep => "build-dep",
-            Rule::Unsafe => "unsafe",
-            Rule::Macro => "macro",
         }
     }
 
@@ -54,15 +35,9 @@ impl Rule {
         match self {
             Rule::Net => Severity::High,
             Rule::SetExecutable => Severity::High,
-            Rule::EnvSecret => Severity::High,
-            Rule::ExecArg => Severity::High,
             Rule::Unanalyzable => Severity::High,
             Rule::Spawn => Severity::Medium,
             Rule::FsWrite => Severity::Medium,
-            Rule::EnvDynamic => Severity::Low,
-            Rule::BuildDep => Severity::Low,
-            Rule::Unsafe => Severity::Low,
-            Rule::Macro => Severity::Low,
         }
     }
 }
@@ -122,15 +97,9 @@ mod tests {
         let table = [
             (Rule::Net, "net", Severity::High),
             (Rule::SetExecutable, "set-executable", Severity::High),
-            (Rule::EnvSecret, "env-secret", Severity::High),
-            (Rule::ExecArg, "exec-arg", Severity::High),
             (Rule::Unanalyzable, "unanalyzable", Severity::High),
             (Rule::Spawn, "spawn", Severity::Medium),
             (Rule::FsWrite, "fs-write", Severity::Medium),
-            (Rule::EnvDynamic, "env-dynamic", Severity::Low),
-            (Rule::BuildDep, "build-dep", Severity::Low),
-            (Rule::Unsafe, "unsafe", Severity::Low),
-            (Rule::Macro, "macro", Severity::Low),
         ];
 
         for (rule, id, severity) in table {
