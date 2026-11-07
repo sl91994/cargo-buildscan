@@ -19,3 +19,6 @@ pub mod source;
 
 #[doc(hidden)]
 pub mod resolve;
+
+#[doc(hidden)]
+pub mod locate;
