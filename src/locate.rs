@@ -10,7 +10,7 @@ pub struct Located<'a> {
     pub build_script: Option<BuildScript>,
     /// kind に proc-macro を含む target を持つ
     pub is_proc_macro: bool,
-    /// kind が build の依存パッケージ名
+    /// kind が build の改名前依存パッケージ名
     pub build_deps: Vec<&'a str>,
 }
 
@@ -59,4 +59,164 @@ fn display_path(root: &Utf8Path, src_path: &Utf8Path) -> String {
         }
     }
     parts.join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// target 1つ分のJSON
+    fn target(kind: &str, src_path: &str) -> Value {
+        json!({
+            "name": "target_name",
+            "kind": [kind],
+            "src_path": src_path
+        })
+    }
+
+    /// 依存1つ分のJSON．
+    /// kind は None ("normal") / Some("build") / Some("dev")
+    fn dep(name: &str, kind: Option<&str>, rename: Option<&str>) -> Value {
+        json!({
+            "name": name,
+            "req": "^1.0",
+            "kind": kind,
+            "optional": false,
+            "rename": rename,
+            "uses_default_features": true,
+            "features": [],
+        })
+    }
+
+    /// `manifest_path` は "/pkg/Cargo.toml" に固定: root は "/pkg"
+    fn package(targets: Vec<Value>, dependencies: Vec<Value>) -> Package {
+        let json_str = json!({
+            "name": "package",
+            "version": "0.1.0",
+            "id": "path+file:///pkg#0.1.0",
+            "dependencies": dependencies,
+            "targets": targets,
+            "features": {},
+            "manifest_path": "/pkg/Cargo.toml"
+        });
+
+        serde_json::from_value(json_str).unwrap()
+    }
+
+    /// `build_script` が Some(`root` / `src_path` / `display_path`) の3つであり，`is_proc_macro()` が false であること
+    #[test]
+    fn build_script_only() {
+        let pkg = package(
+            vec![target("lib", "/pkg/src/lib.rs"), target("custom-build", "/pkg/build.rs")],
+            vec![],
+        );
+        let located = locate(&pkg);
+
+        assert!(!located.is_proc_macro);
+
+        let Some(BuildScript { root, src_path, display_path }) = &located.build_script else {
+            panic!("build_script is None");
+        };
+
+        assert_eq!(root, "/pkg");
+        assert_eq!(src_path, "/pkg/build.rs");
+        assert_eq!(display_path, "build.rs");
+    }
+
+    /// `build_script` が None，`is_proc_macro()` が true であること
+    #[test]
+    fn proc_macro_only() {
+        let pkg = package(vec![target("proc-macro", "/pkg/src/lib.rs")], vec![]);
+        let located = locate(&pkg);
+
+        assert!(located.is_proc_macro);
+        assert!(located.build_script.is_none());
+    }
+
+    /// `build_script` が Some，`is_proc_macro()` が true であること (両方)
+    #[test]
+    fn proc_macro_with_build_script() {
+        let pkg = package(
+            vec![target("proc-macro", "/pkg/src/lib.rs"), target("custom-build", "/pkg/build.rs")],
+            vec![],
+        );
+        let located = locate(&pkg);
+
+        assert!(located.is_proc_macro);
+        assert!(located.build_script.is_some());
+    }
+
+    /// None かつ false
+    #[test]
+    fn neither() {
+        let pkg = package(vec![target("lib", "/pkg/src/lib.rs")], vec![]);
+        let located = locate(&pkg);
+
+        assert!(!located.is_proc_macro);
+        assert!(located.build_script.is_none());
+    }
+
+    /// 名称変更された依存関係の元の名前を取得できるかつ，名称変更後が含まれていないこと
+    #[test]
+    fn build_deps_use_original_name_of_renamed_dependency() {
+        let pkg = package(vec![], vec![dep("reqwest", Some("build"), Some("r"))]);
+        let located = locate(&pkg);
+
+        assert_eq!(located.build_deps, vec!["reqwest"]);
+        assert!(!located.build_deps.contains(&"r"))
+    }
+
+    /// normal / dev / build を混ぜ，build のみ残ること
+    #[test]
+    fn build_deps_exclude_normal_and_dev_dependencies() {
+        let pkg = package(
+            vec![],
+            vec![
+                dep("normal_dep", None, None),
+                dep("dev_dep", Some("dev"), None),
+                dep("build_dep", Some("build"), None),
+            ],
+        );
+        let located = locate(&pkg);
+
+        assert_eq!(located.build_deps, vec!["build_dep"]);
+    }
+
+    /// root の外を指す build script (`build = "../x.rs"`) は絶対パスで表示すること
+    #[test]
+    fn build_script_outside_root_uses_absolute_path() {
+        let pkg = package(vec![target("custom-build", "/pkg/../build.rs")], vec![]);
+        let located = locate(&pkg);
+
+        let Some(BuildScript { root, src_path: _, display_path }) = &located.build_script else {
+            panic!("build_script is None");
+        };
+
+        assert_eq!(root, "/pkg");
+        assert_eq!(display_path, "/pkg/../build.rs");
+    }
+
+    /// `display_path()` の各分岐
+    #[test]
+    fn display_path_cases() {
+        let root = Utf8Path::new("/pkg");
+
+        // (src_path, 期待値)
+        let list = [
+            ("/pkg/build.rs", "build.rs"),
+            ("/pkg/build/main.rs", "build/main.rs"), // 区切りが "/" になること
+            ("/other/build.rs", "/other/build.rs"),  // strip_prefix が失敗する経路
+            ("/pkg/../build.rs", "/pkg/../build.rs"), // strip_prefix は成功するが，ParentDir が残る経路
+            ("/pkgfoo/build.rs", "/pkgfoo/build.rs"), // "/pkg" が文字列として前方一致するが，コンポーネント単位で一致しないこと
+        ];
+
+        for (src_path, expected_value) in list {
+            assert_eq!(
+                display_path(root, src_path.into()),
+                expected_value,
+                "src_path = {src_path}"
+            );
+        }
+    }
 }
