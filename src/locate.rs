@@ -76,7 +76,7 @@ mod tests {
     }
 
     /// 依存1つ分のJSON．
-    /// kind は None ("normal") / Some("build") / Some("dev")
+    /// kind は None("normal") / Some("build") / Some("dev")
     fn dep(name: &str, kind: Option<&str>, rename: Option<&str>) -> Value {
         json!({
             "name": name,
