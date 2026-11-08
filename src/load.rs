@@ -1,4 +1,5 @@
 use std::{
+    fmt::Display,
     fs::File,
     io::{self, Read},
 };
@@ -74,9 +75,11 @@ pub fn parse(source: Source) -> Loaded {
 }
 
 /// メッセージの構築: `mod util; (external module is not loaded)` (path は `#[path]` の値)
-fn external_mod_message(name: &syn::Ident, path: Option<&str>) -> String {
+fn external_mod_message(name: impl Display, path: Option<&str>) -> String {
     match path {
-        Some(p) => format!("#[path = {p:?}] mod {name}; (external module is not loaded)"),
+        Some(p) => {
+            format!("#[path = {p:?}] mod {name}; (external module is not loaded)")
+        }
         None => format!("mod {name}; (external module is not loaded)"),
     }
 }
@@ -148,6 +151,16 @@ impl ExternalInputs<'_> {
                     if kw == "mod" && semi.as_char() == ';' =>
                 {
                     self.report(kw.span(), external_mod_message(name, None));
+                }
+                // macro_rules! の中の mod $n;
+                [
+                    TokenTree::Ident(kw),
+                    TokenTree::Punct(dollar), // メタ変数の接頭辞
+                    TokenTree::Ident(name),   // メタ変数の名前
+                    TokenTree::Punct(semi),
+                    ..,
+                ] if kw == "mod" && dollar.as_char() == '$' && semi.as_char() == ';' => {
+                    self.report(kw.span(), external_mod_message(format_args!("${name}"), None));
                 }
                 // それ以外は再帰で潜る: (..)[..]{..}
                 [TokenTree::Group(g), ..] => {
