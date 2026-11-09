@@ -25,3 +25,6 @@ pub mod locate;
 
 #[doc(hidden)]
 pub mod load;
+
+#[doc(hidden)]
+pub mod names;
