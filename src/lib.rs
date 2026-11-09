@@ -22,3 +22,6 @@ pub mod resolve;
 
 #[doc(hidden)]
 pub mod locate;
+
+#[doc(hidden)]
+pub mod load;

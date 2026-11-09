@@ -18,12 +18,12 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 /// TODO: #34 で値を確定する．
 pub const MAX_SNIPPET_CHARS: usize = 200;
 
-/// `unanalyzable`: 解析しない入力 (#08，#12)
+/// `unanalyzable`: 解析しない入力 (#12)
 pub mod unanalyzable {
     use super::ModulePath;
 
-    /// 読み込まずに `unanalyzable` にするマクロ (`include`，`include_str`，`include_bytes`)
-    pub const INCLUDE_MACROS: &[&str] = &[]; // TODO: #08
+    /// 読み込まずに `unanalyzable` にするマクロ
+    pub const INCLUDE_MACROS: &[&str] = &["include", "include_str", "include_bytes"];
 
     /// そのモジュール自体からのグロブインポートを `unanalyzable` にするモジュール (`std`)
     pub const GLOB_FORBIDDEN_MODULES: &[ModulePath] = &[]; // TODO: #12
